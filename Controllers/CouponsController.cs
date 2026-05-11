@@ -52,11 +52,8 @@ public class CouponsController(AppDbContext db) : ControllerBase
     [HttpPut("{id:guid}")]
     public async Task<ActionResult<Coupon>> Update(Guid id, UpdateCouponRequest request, CancellationToken ct)
     {
-        var coupon = await db.Coupons.FirstOrDefaultAsync(c => c.Id == id, ct);
+        var coupon = await db.LoadForUpdateAsync<Coupon>(id, request.Version, ct);
         if (coupon is null) return NotFound();
-
-        // EF's UPDATE WHERE compares against the Original value; tell it the client's, not the row we loaded.
-        db.Entry(coupon).Property(c => c.Version).OriginalValue = request.Version;
 
         coupon.Code = request.Code;
         coupon.RedemptionsRemaining = request.RedemptionsRemaining;

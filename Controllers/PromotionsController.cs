@@ -49,11 +49,8 @@ public class PromotionsController(AppDbContext db) : ControllerBase
     [HttpPut("{id:guid}")]
     public async Task<ActionResult<Promotion>> Update(Guid id, UpdatePromotionRequest request, CancellationToken ct)
     {
-        var promotion = await db.Promotions.FirstOrDefaultAsync(p => p.Id == id, ct);
+        var promotion = await db.LoadForUpdateAsync<Promotion>(id, request.Version, ct);
         if (promotion is null) return NotFound();
-
-        // Same concurrency pattern as CouponsController: route the client's claimed version into EF's Original.
-        db.Entry(promotion).Property(p => p.Version).OriginalValue = request.Version;
 
         promotion.Name = request.Name;
         promotion.StartsAt = request.StartsAt;
