@@ -34,7 +34,7 @@ DELETE /api/promotions/{id}
 
 ## The concurrency infrastructure
 
-Five pieces compose into a project-wide optimistic-concurrency setup. Every new entity from now on inherits `Entity` and gets the same treatment automatically.
+Six pieces compose into a project-wide optimistic-concurrency setup. Every new entity from now on inherits `Entity` and gets the same treatment automatically.
 
 ### 1. The `Entity` base class
 
@@ -96,7 +96,38 @@ builder.Services.AddDbContext<AppDbContext>((sp, options) =>
 });
 ```
 
-### 4. The retry wrapper
+### 4. The load helper
+
+The `OriginalValue` override that routes the client's claimed version into EF is a one-liner that's easy to forget per handler. A small `DbContext` extension fuses the load with the override so every write handler gets it for free:
+
+```csharp
+// Data/DbContextLoadExtensions.cs
+public static async Task<T?> LoadForUpdateAsync<T>(
+    this DbContext db,
+    Guid id,
+    Guid claimedVersion,
+    CancellationToken ct = default)
+    where T : Entity
+{
+    var entity = await db.Set<T>().FirstOrDefaultAsync(e => e.Id == id, ct);
+    if (entity is null) return null;
+    db.Entry(entity).Property(e => e.Version).OriginalValue = claimedVersion;
+    return entity;
+}
+```
+
+Used in every PUT:
+
+```csharp
+var coupon = await db.LoadForUpdateAsync<Coupon>(id, request.Version, ct);
+if (coupon is null) return NotFound();
+// apply fields...
+await db.SaveChangesAsync(ct);
+```
+
+Forgetting `LoadForUpdateAsync` means forgetting to load the entity at all, which fails on the next line. The "loaded but skipped the override" footgun is structurally impossible. An action filter or model binder could hide the override too, but routing the version through HTTP infrastructure couples the optimistic-concurrency mechanism to the request lifecycle; the helper sits at the data layer instead and works the same from background jobs or hosted services.
+
+### 5. The retry wrapper
 
 `DbUpdateConcurrencyException` carries the conflicting entries in `.Entries`. `entry.ReloadAsync()` refreshes each one from the database. The wrapper combines that with jittered exponential backoff and a max-attempts cap:
 
@@ -136,7 +167,7 @@ public async Task<IActionResult> Redeem(Guid id, CancellationToken ct)
 
 The default policy is three attempts with a 50ms initial backoff. Tune via `ConcurrencyRetryPolicy` per call site under heavy contention.
 
-### 5. The exception filter
+### 6. The exception filter
 
 Conflicts that retry can't resolve, plus conflicts on user-driven updates where retry isn't appropriate (the `PUT` handler), bubble out as `DbUpdateConcurrencyException`. A global exception filter translates them into HTTP 409 with a `ProblemDetails` body:
 
@@ -167,16 +198,20 @@ builder.Services.AddControllers(options =>
 
 ## The `PUT` handler pattern
 
-For user-driven updates where the client edits a stable snapshot of the row and submits a full body, the controller routes the client's claimed `Version` into EF's `OriginalValue`. EF's `UPDATE` then compares against the version the client thought it was editing, not whatever the database has right now:
+For user-driven updates where the client edits a stable snapshot of the row and submits a full body, the concurrency check has to compare against the version the client *read*, not whatever the database has *now*. `LoadForUpdateAsync` (above) takes the claimed version from the request and routes it into EF's `OriginalValue` slot at load time. The handler itself doesn't reference `OriginalValue`:
 
 ```csharp
-// Controllers/CouponsController.cs
-db.Entry(coupon).Property(c => c.Version).OriginalValue = request.Version;
+var coupon = await db.LoadForUpdateAsync<Coupon>(id, request.Version, ct);
+if (coupon is null) return NotFound();
+
+coupon.Code = request.Code;
+// ...
+await db.SaveChangesAsync(ct);
 ```
 
-This is the line that makes the optimistic check do real work in a stateless web service. Without it, EF would compare against the freshly-loaded `Version` and the check would be a no-op.
+Without that routing, EF would compare against the value it just loaded from the database, which always matches trivially, and the optimistic check would be a no-op.
 
-The `PUT` endpoint doesn't use the retry wrapper. The client claimed a specific version; if that version has moved, the user has to decide whether to merge or cancel. The exception filter converts the resulting `DbUpdateConcurrencyException` into a 409 and the caller takes it from there.
+The `PUT` endpoint doesn't use the retry wrapper. The client claimed a specific version; if it has moved, the user has to decide whether to merge or cancel. The exception filter converts the resulting `DbUpdateConcurrencyException` into a 409 and the caller takes it from there.
 
 ## Adding a new entity
 
@@ -222,6 +257,7 @@ Trade-off: the application maintains the token via the interceptor, which is one
 │   ├── AppDbContext.cs                 # DbContext + IsConcurrencyToken model-walk
 │   ├── ConcurrencyInterceptor.cs       # bumps Version on Added/Modified
 │   ├── ConcurrencyRetryPolicy.cs       # MaxAttempts + InitialBackoff record
+│   ├── DbContextLoadExtensions.cs      # LoadForUpdateAsync helper
 │   └── DbContextRetryExtensions.cs     # ExecuteWithConcurrencyRetryAsync wrapper
 ├── Filters/
 │   └── ConcurrencyConflictExceptionFilter.cs   # DbUpdateConcurrencyException → 409
