@@ -232,7 +232,7 @@ Plus a `DbSet`:
 public DbSet<Subscription> Subscriptions => Set<Subscription>();
 ```
 
-The model-walk picks up `Subscription.Version` and marks it as a concurrency token. The interceptor's `Entries<Entity>()` filter bumps it on every save. The exception filter handles its conflicts. No per-entity wiring required; the controller is the only Subscription-specific code.
+The model-walk picks up `Subscription.Version` and marks it as a concurrency token. The interceptor's `Entries<Entity>()` filter bumps it on every save. The exception filter handles its conflicts. The controller's PUT calls `LoadForUpdateAsync<Subscription>(id, request.Version, ct)`; the helper is generic over `T : Entity` and works without per-entity registration. The controller is the only Subscription-specific code.
 
 ## Why an explicit `Version`, not `xmin`?
 
